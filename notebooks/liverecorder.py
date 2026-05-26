@@ -38,28 +38,42 @@ class Liverecorder:
 
     shared_buffer = None
 
-    def __init__(self, max_seconds, max_rate):
+    def __init__(self, max_seconds, max_rate, blocksize=128, latency='low'):
         self.max_samples = max_seconds * max_rate
         self.max_bytes = self.max_samples * 2
         self.shared_buffer = mp.RawArray(ctypes.c_byte, self.max_bytes)
+        self.write_pos = mp.Value(ctypes.c_long, 0)
+        self.blocksize = blocksize
+        self.latency = latency
 
-    def _live_recorder(self, in_device, samplerate, stop_recorder, data_updated, live_count, data_lock, shared_buffer, messages):
+    def _live_recorder(self, in_device, samplerate, blocksize, latency, stop_recorder, data_updated, live_count, write_pos, data_lock, shared_buffer, messages):
         with data_lock:
             stream_data    = np.ndarray((self.max_samples,), dtype=np.int16, buffer=shared_buffer)
             stream_data[:] = 0
+            write_pos.value = 0
+            live_count.value = 0
         def _callback(indata, frames, _, status):
             if status.input_overflow:
                 raise Exception("Buffer overflow")
             with data_lock:
-                stream_data[:-frames] = stream_data[frames:]
-                stream_data[-frames:] = indata[:,0]
+                # Ring buffer write to avoid full-buffer shifts per callback.
+                start = write_pos.value
+                end = start + frames
+                if end <= self.max_samples:
+                    stream_data[start:end] = indata[:, 0]
+                else:
+                    first = self.max_samples - start
+                    stream_data[start:] = indata[:first, 0]
+                    stream_data[:end - self.max_samples] = indata[first:, 0]
+                write_pos.value = end % self.max_samples
                 live_count.value += frames
                 data_updated.set()
         try:
             messages.put("Started live capture")
             with sd.InputStream(device=in_device, channels=1,
                                 callback=_callback,
-                                blocksize=100, dtype=np.int16,
+                                blocksize=blocksize, dtype=np.int16,
+                                latency=latency,
                                 samplerate=samplerate):
                 stop_recorder.wait()
             messages.put("Capture ended normally")
@@ -72,7 +86,9 @@ class Liverecorder:
         with self.data_lock:
             count = self.live_count.value
             self.live_count.value = 0
-            data = np.ndarray((self.max_samples,), dtype=np.int16, buffer=self.shared_buffer).copy()
+            stream_data = np.ndarray((self.max_samples,), dtype=np.int16, buffer=self.shared_buffer)
+            pos = self.write_pos.value
+            data = np.concatenate((stream_data[pos:], stream_data[:pos])).copy()
             self.data_updated.clear()
         return (data, count)
 
@@ -95,7 +111,7 @@ class Liverecorder:
         self.stop_recorder.clear()
         self.messages.put("Will start live capture")
         self.proc = mp.Process(target=self._live_recorder,
-                          args=(in_device, samplerate, self.stop_recorder, self.data_updated, 
-                                self.live_count, self.data_lock, self.shared_buffer, self.messages),
+                          args=(in_device, samplerate, self.blocksize, self.latency, self.stop_recorder, self.data_updated, 
+                          self.live_count, self.write_pos, self.data_lock, self.shared_buffer, self.messages),
                           daemon=True)
         self.proc.start()
