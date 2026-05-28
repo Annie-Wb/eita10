@@ -27,7 +27,7 @@ import sounddevice as sd
 import numpy as np
 
 class Liverecorder:
-    def __init__(self, max_seconds, max_rate, blocksize=128, latency='low'):
+    def __init__(self, max_seconds, max_rate, blocksize=256, latency='low'):
         self.stop_recorder = mp.Event()
         self.data_updated = mp.Event()
         self.live_count = mp.Value(ctypes.c_long, 0)
@@ -35,9 +35,10 @@ class Liverecorder:
         self.data_lock = mp.RLock()
         self.messages = mp.Queue()
         self.proc = None
+        self._scratch = None
         self.max_samples = max_seconds * max_rate
         self.max_bytes = self.max_samples * 2
-        self.shared_buffer = mp.RawArray(ctypes.c_byte, self.max_bytes)
+        self.shared_buffer = mp.RawArray(ctypes.c_int16, self.max_samples)
         self.write_pos = mp.Value(ctypes.c_long, 0)
         self.blocksize = blocksize
         self.latency = latency
@@ -79,16 +80,27 @@ class Liverecorder:
         finally:
             data_updated.set()
 
-    def get_data(self):
+    def get_data(self, window_samples=None, reuse_buffer=False):
         with self.data_lock:
             count = self.live_count.value
             self.live_count.value = 0
             stream_data = np.ndarray((self.max_samples,), dtype=np.int16, buffer=self.shared_buffer)
             pos = self.write_pos.value
-            if pos == 0:
-                data = stream_data.copy()
+            length = self.max_samples if window_samples is None else min(int(window_samples), self.max_samples)
+            start = (pos - length) % self.max_samples
+            if reuse_buffer:
+                if self._scratch is None or self._scratch.size != length:
+                    self._scratch = np.empty(length, dtype=np.int16)
+                data = self._scratch
             else:
-                data = np.concatenate((stream_data[pos:], stream_data[:pos])).copy()
+                data = np.empty(length, dtype=np.int16)
+            if start < pos:
+                data[:] = stream_data[start:pos]
+            else:
+                tail = self.max_samples - start
+                data[:tail] = stream_data[start:]
+                if pos > 0:
+                    data[tail:] = stream_data[:pos]
             self.data_updated.clear()
         return (data, count)
 
